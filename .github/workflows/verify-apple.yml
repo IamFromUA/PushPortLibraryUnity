@@ -1,0 +1,28 @@
+name: Verify Unity Apple bridge
+on: workflow_dispatch
+permissions:
+  contents: read
+jobs:
+  apple-bridge:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Read the package version
+        id: package
+        run: echo "version=$(python3 -c 'import json; print(json.load(open("package.json"))["version"])')" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v4
+        with:
+          repository: IamFromUA/PushPortLibraryApple
+          ref: ${{ steps.package.outputs.version }}
+          path: apple-sdk
+      - name: Link the exported Swift bridge with the public package and extension
+        env:
+          SDK_VERSION: ${{ steps.package.outputs.version }}
+        run: |
+          python3 apple-sdk/scripts/create-consumer.py --output "$RUNNER_TEMP/consumer" --version "$SDK_VERSION"
+          cat Editor/iOS/PushPortUnityBridge.swift.txt >> "$RUNNER_TEMP/consumer/ConsumerApp.swift"
+          xcodebuild -project "$RUNNER_TEMP/consumer/Consumer.xcodeproj" -scheme Consumer \
+            -destination 'generic/platform=iOS Simulator' -derivedDataPath "$RUNNER_TEMP/derived" \
+            build CODE_SIGNING_ALLOWED=NO
+          test -d "$RUNNER_TEMP/derived/Build/Products/Debug-iphonesimulator/Consumer.app/PlugIns/NotificationService.appex"
