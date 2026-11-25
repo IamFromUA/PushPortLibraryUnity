@@ -1,0 +1,177 @@
+package dev.pushport.unity;
+
+import android.app.Activity;
+import android.content.ContentProvider;
+import android.content.ContentValues;
+import android.content.Context;
+import android.content.pm.PackageManager;
+import android.database.Cursor;
+import android.net.Uri;
+import android.os.Bundle;
+import android.util.Log;
+import dev.pushport.sdk.PushPort;
+import dev.pushport.sdk.PushPortStatus;
+import java.util.Collections;
+import java.util.HashMap;
+import java.util.Map;
+import org.json.JSONArray;
+import org.json.JSONException;
+import org.json.JSONObject;
+
+public final class PushPortUnityBridge {
+    private static final String APP_ID_KEY = "dev.pushport.unity.APP_ID";
+    private static volatile String initializationError;
+
+    private static final java.lang.reflect.Method profileBridge = findProfileBridge();
+
+    private static java.lang.reflect.Method findProfileBridge() {
+        try { return PushPort.class.getMethod("appProfileJson", Context.class); }
+        catch (NoSuchMethodException olderSdk) { return null; }
+    }
+
+    private PushPortUnityBridge() {}
+
+    public static String getStatus(Activity activity) {
+        PushPortStatus status = PushPort.status(activity);
+        try {
+            JSONObject result = new JSONObject();
+            if (profileBridge != null) {
+                try {
+                    JSONObject profile = new JSONObject((String) profileBridge.invoke(null, activity));
+                    result.put("appProfile", profile);
+                    result.put("profileChecked", profile.optBoolean("ready"));
+                } catch (ReflectiveOperationException error) {
+                    throw new IllegalStateException("Could not read PushPort application profile", error);
+                }
+            } else {
+                result.put("profileChecked", true);
+            }
+            result.put("configured", status.getConfigured());
+            result.put("installationId", status.getInstallationId());
+            result.put("hasToken", status.getFcmToken() != null);
+            result.put("notificationsEnabled", status.getNotificationsEnabled());
+            result.put("subscribed", status.getSubscribed());
+            result.put("locale", status.getLocale());
+            dev.pushport.sdk.PushPortUser user = PushPort.user(activity);
+            if (user != null) {
+                result.put("userId", user.getUserId());
+                result.put("externalId", user.getExternalId());
+            }
+            result.put("lastSyncedAt", status.getLastSyncedAt());
+            String error = initializationError;
+            if (error == null) error = status.getSyncError();
+            if (error == null) error = status.getPushError();
+            result.put("syncError", error);
+            return result.toString();
+        } catch (org.json.JSONException error) {
+            throw new IllegalStateException("Could not serialize PushPort status.", error);
+        }
+    }
+
+    public static String getUser(Activity activity) throws JSONException {
+        dev.pushport.sdk.PushPortUser user = PushPort.user(activity);
+        if (user == null) return null;
+        JSONObject result = new JSONObject();
+        result.put("userId", user.getUserId());
+        result.put("externalId", user.getExternalId());
+        result.put("revision", user.getRevision());
+        result.put("email", user.getEmail());
+        result.put("phoneNumber", user.getPhoneNumber());
+        result.put("latitude", user.getLatitude());
+        result.put("longitude", user.getLongitude());
+        result.put("hasLocation", user.getLatitude() != null && user.getLongitude() != null);
+        JSONArray tags = new JSONArray();
+        for (Map.Entry<String, String> entry : user.getTags().entrySet())
+            tags.put(new JSONObject().put("key", entry.getKey()).put("value", entry.getValue()));
+        return result.put("tags", tags).toString();
+    }
+
+    public static void requestPermission(Activity activity) {
+        activity.runOnUiThread(() -> {
+            if (!activity.isFinishing() && !activity.isDestroyed()) {
+                PushPort.requestNotificationPermission(activity);
+            }
+        });
+    }
+
+    public static void setSubscribed(Activity activity, boolean enabled) {
+        PushPort.setSubscribed(activity, enabled);
+    }
+
+    public static void setTag(Activity activity, String key, String value) {
+        PushPort.setTags(activity, Collections.singletonMap(key, value));
+    }
+
+    public static void removeTag(Activity activity, String key) {
+        PushPort.setTags(activity, Collections.singletonMap(key, null));
+    }
+
+    public static void applyUpdate(Activity activity, String json) throws JSONException {
+        JSONObject update = new JSONObject(json);
+        String kind = update.getString("kind");
+        boolean clear = update.optBoolean("clear");
+        String value = clear ? null : update.optString("text");
+        switch (kind) {
+            case "locale": PushPort.setLocale(activity, value); break;
+            case "email": PushPort.setEmail(activity, value); break;
+            case "phone": PushPort.setPhoneNumber(activity, value); break;
+            case "consentRequired": PushPort.setConsentRequired(activity, update.getBoolean("enabled")); break;
+            case "consentGiven": PushPort.setConsentGiven(activity, update.getBoolean("enabled")); break;
+            case "location":
+                PushPort.setLocation(activity, clear ? null : update.getDouble("latitude"),
+                        clear ? null : update.getDouble("longitude"));
+                break;
+            case "tags":
+            case "event":
+                Map<String, String> fields = new HashMap<>();
+                JSONArray entries = update.getJSONArray("entries");
+                for (int i = 0; i < entries.length(); i++) {
+                    JSONObject entry = entries.getJSONObject(i);
+                    if (kind.equals("event") && entry.optBoolean("clear"))
+                        throw new IllegalArgumentException("Event properties must have a string value.");
+                    fields.put(entry.getString("key"), entry.optBoolean("clear") ? null : entry.getString("value"));
+                }
+                if (kind.equals("event")) PushPort.trackEvent(activity, value, fields);
+                else PushPort.setTags(activity, fields);
+                break;
+            default: throw new IllegalArgumentException("Unknown PushPort operation.");
+        }
+    }
+
+    public static void login(Activity activity, String externalId, String identityToken) {
+        PushPort.login(activity, externalId, identityToken);
+    }
+
+    public static void logout(Activity activity) {
+        PushPort.logout(activity);
+    }
+
+    public static void sync(Activity activity) {
+        PushPort.sync(activity);
+    }
+
+    public static final class Initializer extends ContentProvider {
+        @Override public boolean onCreate() {
+            Context context = getContext();
+            try {
+                Bundle metadata = context.getPackageManager()
+                        .getApplicationInfo(context.getPackageName(), PackageManager.GET_META_DATA).metaData;
+                String appId = metadata == null ? null : metadata.getString(APP_ID_KEY);
+                if (appId == null) throw new IllegalStateException("Missing PushPort App ID.");
+                if (metadata.getBoolean("dev.pushport.unity.CONSENT_REQUIRED", false))
+                    PushPort.setConsentRequired(context, true);
+                PushPort.initWithContext(context, appId);
+            } catch (PackageManager.NameNotFoundException | IllegalArgumentException | IllegalStateException error) {
+                initializationError = "PushPort initialization failed. Check the App ID and the existing installation.";
+                Log.e("PushPortUnity", initializationError);
+            }
+            return true;
+        }
+
+        @Override public String getType(Uri uri) { return null; }
+        @Override public Cursor query(Uri uri, String[] projection, String selection, String[] args, String order) { return null; }
+        @Override public Uri insert(Uri uri, ContentValues values) { throw new UnsupportedOperationException(); }
+        @Override public int update(Uri uri, ContentValues values, String selection, String[] args) { throw new UnsupportedOperationException(); }
+        @Override public int delete(Uri uri, String selection, String[] args) { throw new UnsupportedOperationException(); }
+    }
+}

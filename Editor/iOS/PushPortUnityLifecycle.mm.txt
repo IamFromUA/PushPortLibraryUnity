@@ -1,0 +1,47 @@
+#import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+
+#if UNITY_XCODE_PROJECT_TYPE_SWIFT
+#import <UnityAPI/UnityAPI-Swift.h>
+#else
+#import "Classes/PluginBase/AppDelegateListener.h"
+#endif
+
+extern "C" void PushPortUnityBoot(void);
+extern "C" void PushPortUnityReceiveToken(const void *bytes, int32_t length);
+extern "C" void PushPortUnityRegistrationFailed(void);
+
+@interface PushPortUnityLifecycle : NSObject
+@end
+
+@implementation PushPortUnityLifecycle
++ (void)load
+{
+    NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
+#if UNITY_XCODE_PROJECT_TYPE_SWIFT
+    NSNotificationName willLaunch = UnityNotifications.applicationWillFinishLaunching;
+    NSNotificationName registered = UnityNotifications.applicationDidRegisterForRemoteNotiFications;
+    NSNotificationName failed = UnityNotifications.applicationDidFailToRegisterForRemoteNotifications;
+#else
+    NSNotificationName willLaunch = kUnityWillFinishLaunchingWithOptions;
+    NSNotificationName registered = kUnityDidRegisterForRemoteNotificationsWithDeviceToken;
+    NSNotificationName failed = kUnityDidFailToRegisterForRemoteNotificationsWithError;
+#endif
+    [center addObserverForName:willLaunch object:nil queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(__unused NSNotification *notice) { PushPortUnityBoot(); }];
+    [center addObserverForName:registered object:nil queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(NSNotification *notice) {
+#if UNITY_XCODE_PROJECT_TYPE_SWIFT
+        id value = notice.userInfo[UnityNotifications.remoteNotificationsDeviceTokenKey];
+#else
+        id value = notice.userInfo;
+#endif
+        if ([value isKindOfClass:NSData.class]) {
+            NSData *token = value;
+            PushPortUnityReceiveToken(token.bytes, (int32_t)token.length);
+        }
+    }];
+    [center addObserverForName:failed object:nil queue:[NSOperationQueue mainQueue]
+                    usingBlock:^(__unused NSNotification *notice) { PushPortUnityRegistrationFailed(); }];
+}
+@end

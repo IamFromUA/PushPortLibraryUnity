@@ -1,0 +1,5 @@
+{
+  "name": "PushPort.Unity.Editor",
+  "rootNamespace": "PushPort.Unity.Editor",
+  "includePlatforms": ["Editor"]
+}

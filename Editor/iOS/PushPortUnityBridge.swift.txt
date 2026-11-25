@@ -1,0 +1,240 @@
+import Foundation
+import PushPort
+import UIKit
+
+@MainActor
+private enum UnityBridge {
+    static var initialized = false
+    static var initializationError: String?
+    static var operationError: String?
+
+    static var consentBoot: Task<Void, Never>?
+    static var pendingOperation: Task<Void, Never>?
+
+    static func boot() {
+        guard !initialized, initializationError == nil, consentBoot == nil else { return }
+        if Bundle.main.object(forInfoDictionaryKey: "PushPortUnityConsentRequired") as? Bool == true {
+            consentBoot = Task { @MainActor in
+                do { try await PushPort.shared.setConsentRequired(true); initialize() }
+                catch { initializationError = "Failed to configure consent." }
+            }
+        } else { initialize() }
+    }
+
+    private static func initialize() {
+        guard !initialized, initializationError == nil else { return }
+        guard let appId = Bundle.main.object(forInfoDictionaryKey: "PushPortUnityAppId") as? String,
+              let raw = Bundle.main.object(forInfoDictionaryKey: "PushPortUnityAPNsEnvironment") as? String,
+              let environment = APNsEnvironment(rawValue: raw) else {
+            initializationError = "Set the PushPort App ID and APNs environment in Unity Project Settings."
+            return
+        }
+        do {
+            try PushPort.shared.initialize(appId: appId, environment: environment)
+            PushPort.shared.onNotificationOpened = { notification in
+                if let url = notification.clickURL {
+                    UIApplication.shared.open(url, options: [:]) { accepted in
+                        guard PushPort.shared.collectionEnabled,
+                              let group = Bundle.main.object(forInfoDictionaryKey: "PushPortAppGroup") as? String,
+                              let directory = FileManager.default.containerURL(forSecurityApplicationGroupIdentifier: group)
+                        else { return }
+                        let event = NotificationEvent(type: accepted ? "link_opened" : "link_failed",
+                            messageId: notification.messageId, reason: accepted ? nil : "no_handler")
+                        try? NotificationInbox(directory: directory).append(appId: notification.appId, event: event)
+                        PushPort.shared.sync()
+                    }
+                }
+            }
+            initialized = true
+        } catch {
+            let message = "PushPort initialization failed. Check the App ID, APNs environment and existing installation."
+            initializationError = message
+            NSLog("%@", message)
+        }
+    }
+
+    static func status() -> String? {
+        boot()
+        let sdk = PushPort.shared
+        let current = sdk.status
+        var values: [String: Any] = [
+            "configured": initialized,
+            "hasToken": current?.hasToken ?? false,
+            "subscribed": current?.subscribed ?? false,
+            "notificationsEnabled": current?.notificationsEnabled ?? false
+        ]
+        values["installationId"] = current?.installationId
+        values["locale"] = current?.locale
+        if let current, let data = try? JSONEncoder().encode(current),
+           let native = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            values["appProfile"] = native["appProfile"]
+            values["profileChecked"] = native["profileChecked"] ?? (native["appProfile"] == nil)
+        }
+        values["userId"] = sdk.user?.userId
+        values["externalId"] = sdk.user?.externalId
+        values["lastSyncedAt"] = current?.lastSyncedAt
+        values["syncError"] = initializationError ?? operationError ?? sdk.registrationError ?? current?.syncError
+        guard let data = try? JSONSerialization.data(withJSONObject: values) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func run(_ operation: @escaping @MainActor (PushPort) async throws -> Void) {
+        boot()
+        let previous = pendingOperation
+        pendingOperation = Task { @MainActor in
+            await consentBoot?.value
+            await previous?.value
+            guard initialized else { return }
+            do {
+                try await operation(PushPort.shared)
+                operationError = nil
+            } catch {
+                let message = "PushPort could not apply the requested operation."
+                operationError = message
+                NSLog("%@", message)
+            }
+        }
+    }
+}
+
+private func onMain<T: Sendable>(_ action: @escaping @MainActor () -> T) -> T {
+    if Thread.isMainThread {
+        return MainActor.assumeIsolated { action() }
+    }
+    return DispatchQueue.main.sync { action() }
+}
+
+@_cdecl("PushPortUnityBoot")
+func pushPortUnityBoot() {
+    onMain { UnityBridge.boot() }
+}
+
+@_cdecl("PushPortUnityReceiveToken")
+func pushPortUnityReceiveToken(_ bytes: UnsafeRawPointer?, _ length: Int32) {
+    guard let bytes, length > 0 else { return }
+    let token = Data(bytes: bytes, count: Int(length))
+    onMain { UnityBridge.run { $0.didRegisterForRemoteNotifications(deviceToken: token) } }
+}
+
+@_cdecl("PushPortUnityRegistrationFailed")
+func pushPortUnityRegistrationFailed() {
+    onMain {
+        UnityBridge.run { sdk in
+            sdk.didFailToRegisterForRemoteNotifications(error: NSError(domain: "dev.pushport.unity", code: 1))
+        }
+    }
+}
+
+@_cdecl("PushPortUnityGetStatus")
+func pushPortUnityGetStatus() -> UnsafeMutablePointer<CChar>? {
+    guard let status = onMain({ UnityBridge.status() }) else { return nil }
+    return strdup(status)
+}
+
+@_cdecl("PushPortUnityGetUser")
+func pushPortUnityGetUser() -> UnsafeMutablePointer<CChar>? {
+    let json: String? = onMain {
+        UnityBridge.boot()
+        guard let user = PushPort.shared.user else { return nil }
+        let profile = user.properties
+        var data: [String: Any] = ["userId": user.userId, "revision": user.revision,
+            "tags": profile.tags.map { ["key": $0.key, "value": $0.value] },
+            "hasLocation": profile.latitude != nil && profile.longitude != nil]
+        data["externalId"] = user.externalId
+        data["email"] = profile.email
+        data["phoneNumber"] = profile.phoneNumber
+        data["latitude"] = profile.latitude
+        data["longitude"] = profile.longitude
+        guard let bytes = try? JSONSerialization.data(withJSONObject: data) else { return nil }
+        return String(data: bytes, encoding: .utf8)
+    }
+    return json.flatMap { strdup($0) }
+}
+
+@_cdecl("PushPortUnityFree")
+func pushPortUnityFree(_ pointer: UnsafeMutableRawPointer?) {
+    free(pointer)
+}
+
+@_cdecl("PushPortUnityRequestPermission")
+func pushPortUnityRequestPermission() {
+    onMain { UnityBridge.run { _ = try await $0.requestPermission() } }
+}
+
+@_cdecl("PushPortUnitySetSubscribed")
+func pushPortUnitySetSubscribed(_ enabled: Int32) {
+    onMain { UnityBridge.run { try await $0.setSubscribed(enabled != 0) } }
+}
+
+@_cdecl("PushPortUnitySetTag")
+func pushPortUnitySetTag(_ key: UnsafePointer<CChar>?, _ value: UnsafePointer<CChar>?) {
+    guard let key else { return }
+    let tags = [String(cString: key): value.map { String(cString: $0) }]
+    onMain { UnityBridge.run { try await $0.setTags(tags) } }
+}
+
+private struct UnityUpdate: Decodable {
+    struct Entry: Decodable { let key: String; let value: String?; let clear: Bool }
+    let kind: String
+    let text: String?
+    let clear: Bool
+    let enabled: Bool
+    let latitude: Double
+    let longitude: Double
+    let entries: [Entry]?
+
+    @MainActor func apply(to sdk: PushPort) async throws {
+        let value = clear ? nil : text
+        switch kind {
+        case "locale": try await sdk.setLocale(value)
+        case "email": try await sdk.setEmail(value)
+        case "phone": try await sdk.setPhoneNumber(value)
+        case "location": try await sdk.setLocation(latitude: clear ? nil : latitude, longitude: clear ? nil : longitude)
+        case "consentRequired": try await sdk.setConsentRequired(enabled)
+        case "consentGiven": try await sdk.setConsentGiven(enabled)
+        case "tags":
+            var tags = [String: String?]()
+            for entry in entries ?? [] { tags.updateValue(entry.clear ? nil : entry.value, forKey: entry.key) }
+            try await sdk.setTags(tags)
+        case "event":
+            guard let name = text else { throw PushPortFailure.invalidConfiguration }
+            var properties = [String: String]()
+            for entry in entries ?? [] {
+                guard !entry.clear, let value = entry.value else { throw PushPortFailure.invalidConfiguration }
+                properties[entry.key] = value
+            }
+            try await sdk.trackEvent(name, properties: properties)
+        default: throw PushPortFailure.invalidConfiguration
+        }
+    }
+}
+
+@_cdecl("PushPortUnityApplyUpdate")
+func pushPortUnityApplyUpdate(_ json: UnsafePointer<CChar>?) {
+    guard let json else { return }
+    let data = Data(String(cString: json).utf8)
+    onMain { UnityBridge.run { sdk in
+        try await JSONDecoder().decode(UnityUpdate.self, from: data).apply(to: sdk)
+    } }
+}
+
+@_cdecl("PushPortUnityLogin")
+func pushPortUnityLogin(_ externalId: UnsafePointer<CChar>?, _ identityToken: UnsafePointer<CChar>?) {
+    guard let externalId, let identityToken else { return }
+    let id = String(cString: externalId)
+    let token = String(cString: identityToken)
+    onMain { UnityBridge.run { try await $0.login(externalId: id, identityToken: token) } }
+}
+
+@_cdecl("PushPortUnityLogout")
+func pushPortUnityLogout() {
+    onMain { UnityBridge.run { try await $0.logout() } }
+}
+
+@_cdecl("PushPortUnitySync")
+func pushPortUnitySync() {
+    onMain {
+        UnityBridge.boot()
+        PushPort.shared.sync()
+    }
+}

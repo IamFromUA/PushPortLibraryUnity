@@ -1,0 +1,13 @@
+{
+  "name": "com.pushport.unity",
+  "version": "0.1.1",
+  "displayName": "PushPort",
+  "description": "PushPort mobile push notifications for Unity games on Android and iOS.",
+  "unity": "6000.3",
+  "author": { "name": "Oleh Yurkov", "email": "support@pushport.dev", "url": "https://pushport.dev" },
+  "license": "Apache-2.0",
+  "dependencies": {
+    "com.unity.modules.androidjni": "1.0.0",
+    "com.unity.modules.jsonserialize": "1.0.0"
+  }
+}
